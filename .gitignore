@@ -1,0 +1,9 @@
+#IGNORE THE DATASETS
+datasets/
+
+#IGNORE THE ENV
+.venv/
+
+generated_file/
+
+.vscode/
