@@ -39,6 +39,10 @@ def load_excel_files(folder_path):
       It loads all the text files in the folder and returns a DataFrame.
       '''
     dataframes = []
+    files = [filename for filename in os.listdir(folder_path) if filename.endswith('.txt')]
+    
+    files.sort(key=FileUtil.extract_date)
+    
     for filename in os.listdir(folder_path):
         if filename.endswith('.txt'):
             file_path = os.path.join(folder_path, filename)
