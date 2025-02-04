@@ -5,7 +5,9 @@ import tensorflow as tf
 from tensorflow.keras import layers
 import gc
 import torch
+import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import re
 
 from utils.file import FileUtil
 
@@ -54,9 +56,10 @@ combined_data_list = []
 files = []
 
 for root, dirs, filenames in os.walk(FileUtil.DATASER_INTEGRATION_PATH):
+    dirs.sort(key=FileUtil.extract_date)
+    filenames = sorted([f for f in filenames if f.endswith('.pkl')], key=FileUtil.extract_date_and_number_from_filename)
     for filename in filenames:
-        if filename.endswith('.pkl'):
-            files.append(os.path.join(root, filename))
+        files.append(os.path.join(root, filename))
 
 for i, file in enumerate(files):
     try:
@@ -74,8 +77,8 @@ for i, file in enumerate(files):
     camera = data.get('camera')
     focal = data.get('focal')
 
-    if None in [rot_mats, betas, expression, phi, joints, camera, focal]:
-        print(f"Skipping file due to missing data: {file}")
+    if any(x is None or len(x) == 0 for x in [rot_mats, betas, expression, phi, joints, camera, focal]):
+        print(f"Skipping file due to missing or empty data: {file}")
         continue
 
     joints_normalized = normalize(joints, 'joints')
