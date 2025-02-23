@@ -1,5 +1,6 @@
 from io import StringIO
 import sys
+import pandas as pd
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from gensim.models import FastText
@@ -13,19 +14,32 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.file import FileUtil
 
+MAX_LEN = 80
+
 def preprocess_text(text):
     text = re.sub(r'[^a-zA-Z\s]', '', text)
     return text.lower()
+
+def load_text_files(text, model):
+    words = preprocess_text(text).split()
+    word_embeddings = [model.wv[word] for word in words if word in model.wv]
+
+    if word_embeddings:
+        embeddings = np.vstack(word_embeddings)
+        if embeddings.shape[0] < MAX_LEN:
+            pad_width = MAX_LEN - embeddings.shape[0]
+            embeddings = np.pad(embeddings, ((0, pad_width), (0, 0)), mode='constant')
+    else:
+        embeddings = np.zeros((MAX_LEN, model.vector_size))
+
+    return np.array([embeddings])
+
 
 def get_text_embeddings(text: str):
     fasttext_model_path = os.path.join(FileUtil.MODEL_FOLDER_PATH, "fasttext_model.model")
     fasttext_model = FastText.load(fasttext_model_path)
 
-    cleaned_text = preprocess_text(text)
-    words = cleaned_text.split()
-    fasttext_embeddings = [fasttext_model.wv[word] for word in words if word in fasttext_model.wv]
+    embeddings = load_text_files(text, fasttext_model)
 
-    if fasttext_embeddings:
-        return np.mean(fasttext_embeddings, axis=0)
-    
-    return np.zeros(fasttext_model.vector_size)
+    return embeddings
+

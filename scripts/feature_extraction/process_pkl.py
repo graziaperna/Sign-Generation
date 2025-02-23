@@ -16,14 +16,10 @@ from gensim.models import FastText
 from utils.file import FileUtil
 print(tf.__version__)
 
-LATENT_DIM = 256
+LATENT_DIM = 16
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 generated_file_folder_path = os.path.join(current_dir, "../../generated_file/")
-audio_model_path = os.path.join(generated_file_folder_path, "models/audio_embedding.h5")
-text_model_path = os.path.join(generated_file_folder_path, "models/fasttext_model.model")
-text_embedding_path = os.path.join(generated_file_folder_path, "models/fasttext_word_embeddings.npy")
-metrics_path = os.path.join(generated_file_folder_path, "models/gan_metrics.csv")
 
 
 def process_data(data, name=""):
@@ -58,6 +54,7 @@ def process_data(data, name=""):
 
     return data
 
+
 def get_movement_data(movement_data):
 
     rot_mats = process_data(movement_data.get("rot_mats"), "rot_mats")
@@ -66,12 +63,7 @@ def get_movement_data(movement_data):
     if any(x is None or len(x) == 0 for x in [rot_mats, betas]):
         raise TypeError("Skipping data due to missing or empty values in 'rot_mats' or 'betas'.")
 
-
-    rot_mats = (rot_mats - rot_mats.mean()) / (rot_mats.std() + 1e-8)
-    betas = (betas - betas.mean()) / (betas.std() + 1e-8)
-
     return rot_mats, betas
-
 
 
 def tensor_to_numpy(tensor):
@@ -83,19 +75,6 @@ def tensor_to_numpy(tensor):
             tensor = tensor.cpu()
         return tensor.numpy()
     return tensor
-
-
-print("Loading FastText model...")
-ft_model = FastText.load(text_model_path)
-text_embeddings = np.load(text_embedding_path)
-
-print(f"text_embeddings shape: {text_embeddings.shape}")
-
-print("Loading audio embeddings...")
-with h5py.File(audio_model_path, "r") as f:
-    audio_embeddings = np.array(f[const.AUDIO_EMBEDDING_NAME])
-
-print(f"audio_embeddings shape: {audio_embeddings.shape}")
 
 beta_list = []
 rot_mats_list = []
@@ -121,7 +100,7 @@ for i, file in enumerate(files):
     print(f"Files remaining: {len(files) - (i + 1)}")
 
 import psutil
-print(f"Memoria disponibile: {psutil.virtual_memory().available / (1024 ** 3):.2f} GB")
+print(f"Available memory: {psutil.virtual_memory().available / (1024 ** 3):.2f} GB")
 print("Data concatenation starting...")
 all_rot_mats = np.concatenate(rot_mats_list, axis=0)
 del rot_mats_list
@@ -129,7 +108,7 @@ all_betas = np.concatenate(beta_list, axis=0)
 del beta_list
 print("Data concatenation completed.")
 gc.collect()
-print(f"Memoria disponibile: {psutil.virtual_memory().available / (1024 ** 3):.2f} GB")
+print(f"Available memory: {psutil.virtual_memory().available / (1024 ** 3):.2f} GB")
 
 if all_rot_mats.ndim == 1:
     all_rot_mats = np.expand_dims(all_rot_mats, axis=1)

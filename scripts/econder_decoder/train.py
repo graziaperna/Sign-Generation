@@ -1,67 +1,22 @@
 import os
-import pandas as pd
 import numpy as np
-import tensorflow as tf
-from gensim.models import FastText
-from tensorflow.keras.optimizers import Adam
-import keras_tuner as kt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import csv
-import sys
-import gc
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from econder_decoder import const
-import h5py
-from gensim.models import FastText
-from utils.file import FileUtil
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.layers import Masking
-from tensorflow.keras import layers, Model
+import random
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-generated_file_folder_path = os.path.join(current_dir, "../../generated_file/")
-audio_model_path = os.path.join(generated_file_folder_path, "models/audio_embedding.h5")
-text_model_path = os.path.join(generated_file_folder_path, "models/fasttext_model.model")
-text_embedding_path = os.path.join(generated_file_folder_path, "models/fasttext_word_embeddings.npy")
-metrics_path = os.path.join(generated_file_folder_path, "models/gan_metrics.csv")
+#nohup python -u scripts/feature_extraction/enc_dec.py > out.log 2>&1 &
 
-tf.keras.backend.clear_session()
-gc.collect()
-
-print("Loading FastText model...")
-ft_model = FastText.load(text_model_path)
-text_embeddings = np.load(text_embedding_path)
-
-print(f"text_embeddings shape: {text_embeddings.shape}")
-
-print("Loading audio embeddings...")
-with h5py.File(audio_model_path, "r") as f:
-    audio_embeddings = np.array(f[const.AUDIO_EMBEDDING_NAME])
-print(f"audio_embeddings shape: {audio_embeddings.shape}")
-
-print("Loading motions...")
-motion_data = np.load(os.path.join(generated_file_folder_path, "pkl_precessed.npz"))
-all_rot_mats = np.array(motion_data["all_rot_mats"], copy=True)
-all_betas = np.array(motion_data["all_betas"], copy=True)
-print(f"all_betas : {all_betas.shape}")
-print(f"all_rot_mats : {all_rot_mats.shape}")
-
-import os
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, Model
-import csv
-
-# -------------------------
-# FUNZIONI DI RESAMPLING (rimangono invariate)
-# -------------------------
 
 def resample_sequence(data, target_length):
-    data_tensor = tf.convert_to_tensor(data, dtype=tf.float32)
-    data_tensor = tf.expand_dims(data_tensor, axis=0)
-    data_tensor = tf.expand_dims(data_tensor, axis=-1)
-    resized = tf.image.resize(data_tensor, size=(target_length, tf.shape(data_tensor)[2]), method='area')
-    resized = tf.squeeze(resized, axis=0)
-    resized = tf.squeeze(resized, axis=-1)
+    data_tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0).transpose(1, 2)
+    resized = F.interpolate(data_tensor, size=target_length, mode='area')
+    resized = resized.transpose(1, 2).squeeze(0)
     return resized
 
 def split_and_resample_motion(motion_array, num_samples, target_length, dim):
@@ -80,248 +35,468 @@ def split_and_resample_motion(motion_array, num_samples, target_length, dim):
                 segment = np.concatenate([segment, np.repeat(segment[:, -1:], repeat, axis=-1)], axis=-1)
             else:
                 segment = segment[:, :dim]
-        resampled = resample_sequence(segment, target_length)
-        segments.append(resampled.numpy())
+        resampled = resample_sequence(segment, target_length).cpu().numpy()
+        segments.append(resampled)
     return np.stack(segments)
 
-# -------------------------
-# MODELLI
-# -------------------------
 
-def build_generator(text_embedding_dim, audio_embedding_dim, latent_dim=32):
-    text_input = layers.Input(shape=(None, text_embedding_dim), name='text_input')
-    audio_input = layers.Input(shape=(None, audio_embedding_dim), name='audio_input')
-    
-    x_text = layers.Masking(mask_value=0.0)(text_input)
-    x_audio = layers.Masking(mask_value=0.0)(audio_input)
-    
-    text_encoded = layers.GRU(latent_dim, return_sequences=True, activation='tanh', name='text_encoder')(x_text)
-    audio_encoded = layers.GRU(latent_dim, return_sequences=True, activation='tanh', name='audio_encoder')(x_audio)
-    
-    x = layers.Concatenate(axis=-1, name='concat_inputs')([text_encoded, audio_encoded])
-    
-    x = layers.GRU(latent_dim, return_sequences=True, activation='tanh', name='decoder_gru')(x)
-    
-    betas = layers.TimeDistributed(layers.Dense(10, activation='linear'), name='betas_output')(x)
-    rot_mats = layers.TimeDistributed(layers.Dense(9, activation='linear'), name='rot_mats_output')(x)
-    
-    return Model(inputs=[text_input, audio_input],
-                 outputs=[betas, rot_mats],
-                 name='generator')
+class RepeatText(nn.Module):
+    def forward(self, text_state, audio_seq):
+        time_steps = audio_seq.size(1)
+        text_state_expanded = text_state.unsqueeze(1).repeat(1, time_steps, 1)
+        return text_state_expanded
 
-def build_discriminator(betas_dim=10, rot_dim=9):
-    betas_input = layers.Input(shape=(None, betas_dim), name='betas_input')
-    rot_input = layers.Input(shape=(None, rot_dim), name='rot_mats_input')
+class Generator(nn.Module):
+    def __init__(self, text_embedding_dim, audio_embedding_dim, latent_dim=16):
+        super(Generator, self).__init__()
+        self.text_encoder = nn.GRU(input_size=text_embedding_dim, hidden_size=latent_dim, batch_first=True)
+        self.audio_encoder = nn.GRU(input_size=audio_embedding_dim, hidden_size=latent_dim, batch_first=True)
+        self.decoder_gru = nn.GRU(input_size=latent_dim*2, hidden_size=latent_dim, batch_first=True)
+        self.fc_betas = nn.Linear(latent_dim, 10)
+        self.fc_rot_mats = nn.Linear(latent_dim, 42)
+        self.repeat_text = RepeatText()
+        
+    def forward(self, text_input, audio_input):
+        text_encoded, text_state = self.text_encoder(text_input)  
+        text_state = text_state.squeeze(0)
+        audio_encoded, _ = self.audio_encoder(audio_input)
+        repeated_text = self.repeat_text(text_state, audio_encoded)
+        x = torch.cat([audio_encoded, repeated_text], dim=-1)
+        x, _ = self.decoder_gru(x)
+        betas = self.fc_betas(x)
+        rot_mats = self.fc_rot_mats(x)
+        return betas, rot_mats
+
+class Discriminator(nn.Module):
+    def __init__(self, betas_dim=10, rot_dim=42):
+        super(Discriminator, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=betas_dim+rot_dim, out_channels=128, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(128, 1)
+        
+    def forward(self, betas, rot_mats):
+        x = torch.cat([betas, rot_mats], dim=-1)
+        x = x.permute(0, 2, 1)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.leaky_relu(x)
+        x = self.dropout(x)
+        features = x
+        x = x.mean(dim=2)
+        score = self.fc(x)
+        return score, features
+
+class GTMapper(nn.Module):
+   
+    def __init__(self, in_dim, out_dim):
+        super(GTMapper, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+    def forward(self, x):
+        return self.linear(x)
+
+def dtw_distance_average(seq1, seq2):
+    distance, path = fastdtw(seq1, seq2, dist=euclidean)
+    return distance / len(path)
+
+def compute_velocity(seq):
+    return np.diff(seq, axis=0)
+
+def compute_acceleration(seq):
+    v = compute_velocity(seq)
+    return np.diff(v, axis=0)
+
+def mse(a, b):
+    return np.mean((a - b)**2)
+
+def evaluate_geometric_errors(real_seq, fake_seq):
+    mse_pose = mse(real_seq, fake_seq)
+    real_vel = compute_velocity(real_seq)
+    fake_vel = compute_velocity(fake_seq)
+    mse_vel = mse(real_vel, fake_vel)
+    real_acc = compute_acceleration(real_seq)
+    fake_acc = compute_acceleration(fake_seq)
+    mse_acc = mse(real_acc, fake_acc)
+    return mse_pose, mse_vel, mse_acc
+
+def diversity_metric(fake_sequences, num_pairs=20):
+    n = len(fake_sequences)
+    if n < 2:
+        return 0.0
+    distances = []
+    for _ in range(num_pairs):
+        i, j = random.sample(range(n), 2)
+        seq1 = fake_sequences[i].reshape(-1)
+        seq2 = fake_sequences[j].reshape(-1)
+        dist = np.linalg.norm(seq1 - seq2)
+        distances.append(dist)
+    return np.mean(distances)
+
+import torch.nn as nn
+
+class SignBlueLoss(nn.Module):
+    def __init__(self, weights=None):
+        super(SignBlueLoss, self).__init__()
+        self.mse_loss = nn.MSELoss()
+
+        if weights is None:
+            self.weights = {
+                "MSE_pose": 0.5,
+                "MSE_vel": 0.2,
+                "MSE_acc": 0.2,
+                "DTW_mean": 0.2,
+                "Diversity": 0.5
+            }
+        else:
+            self.weights = weights
+
+    def forward(self, real_betas, real_rots, fake_betas, fake_rots):
+
+        mse_pose = self.mse_loss(fake_betas, real_betas) + self.mse_loss(fake_rots, real_rots)
+
+        mse_vel = self.mse_loss(torch.diff(fake_betas, dim=1), torch.diff(real_betas, dim=1)) + \
+                  self.mse_loss(torch.diff(fake_rots, dim=1), torch.diff(real_rots, dim=1))
+
+        mse_acc = self.mse_loss(torch.diff(fake_betas, n=2, dim=1), torch.diff(real_betas, n=2, dim=1)) + \
+                  self.mse_loss(torch.diff(fake_rots, n=2, dim=1), torch.diff(real_rots, n=2, dim=1))
+
+        diversity_real_betas = torch.std(real_betas, dim=0).mean()
+        diversity_fake_betas = torch.std(fake_betas, dim=0).mean()
+        diversity_real_rots = torch.std(real_rots, dim=0).mean()
+        diversity_fake_rots = torch.std(fake_rots, dim=0).mean()
+
+        diversity_score = torch.abs(diversity_real_betas - diversity_fake_betas) + \
+                          torch.abs(diversity_real_rots - diversity_fake_rots)
+
+        signblue_loss = (
+            self.weights["MSE_pose"] * mse_pose +
+            self.weights["MSE_vel"] * mse_vel +
+            self.weights["MSE_acc"] * mse_acc +
+            self.weights["Diversity"] * diversity_score
+        )
+
+        return signblue_loss
+
+
+def evaluate_motion_metrics(real_betas_epoch, real_rots_epoch,
+                            fake_betas_epoch, fake_rots_epoch,
+                            max_samples=20, downsample_factor=8):
+    N = real_betas_epoch.shape[0]
+    if N > max_samples:
+        indices = random.sample(range(N), k=max_samples)
+    else:
+        indices = list(range(N))
+        
+    dtw_vals = []
+    mse_pose_vals = []
+    mse_vel_vals = []
+    mse_acc_vals = []
+    merged_fake = []
     
-    x = layers.Concatenate(axis=-1, name='concat_discriminator')([betas_input, rot_input])
-    x = layers.Conv1D(32, kernel_size=3, activation=None, padding='same', name='disc_conv')(x)
-    x = layers.BatchNormalization(name='disc_bn')(x)
-    x = layers.LeakyReLU(alpha=0.2, name='disc_leakyrelu')(x)
-    x = layers.Dropout(0.1, name='disc_dropout')(x)  # Riduce la capacità del discriminatore
+    for i in indices:
+        rb = real_betas_epoch[i]
+        rr = real_rots_epoch[i]
+        fb = fake_betas_epoch[i]
+        fr = fake_rots_epoch[i]
+        
+        rb_down = rb[::downsample_factor]
+        rr_down = rr[::downsample_factor]
+        fb_down = fb[::downsample_factor]
+        fr_down = fr[::downsample_factor]
+        
+        dtw_betas = dtw_distance_average(rb_down, fb_down)
+        dtw_rot   = dtw_distance_average(rr_down, fr_down)
+        dtw_vals.append((dtw_betas + dtw_rot) / 2.0)
+        
+        if rb_down.shape[0] == fb_down.shape[0] and rr_down.shape[0] == fr_down.shape[0]:
+            mse_b_pose, mse_b_vel, mse_b_acc = evaluate_geometric_errors(rb_down, fb_down)
+            mse_r_pose, mse_r_vel, mse_r_acc = evaluate_geometric_errors(rr_down, fr_down)
+            mse_pose_vals.append((mse_b_pose + mse_r_pose)/2.0)
+            mse_vel_vals.append((mse_b_vel + mse_r_vel)/2.0)
+            mse_acc_vals.append((mse_b_acc + mse_r_acc)/2.0)
+        
+        merged = np.concatenate([fb, fr], axis=-1)
+        merged_fake.append(merged)
+        
+    dtw_mean = np.mean(dtw_vals) if dtw_vals else 0.0
+    mse_pose_mean = np.mean(mse_pose_vals) if mse_pose_vals else 0.0
+    mse_vel_mean  = np.mean(mse_vel_vals)  if mse_vel_vals else 0.0
+    mse_acc_mean  = np.mean(mse_acc_vals)  if mse_acc_vals else 0.0
+    merged_fake = np.array(merged_fake)
+    div_value = diversity_metric(merged_fake, num_pairs=20) if len(merged_fake) > 1 else 0.0
     
-    # Salviamo le feature intermedie per feature matching
-    features = x
-    x = layers.GlobalAveragePooling1D(name='disc_gap')(x)
-    score = layers.Dense(1, activation='linear', name='disc_score')(x)
+    return {
+        "DTW_mean": dtw_mean,
+        "MSE_pose": mse_pose_mean,
+        "MSE_vel": mse_vel_mean,
+        "MSE_acc": mse_acc_mean,
+        "Diversity": div_value
+    }
+
+def gradient_penalty(discriminator, real_betas, real_rots, fake_betas, fake_rots):
+    batch_size = real_betas.size(0)
+    alpha_betas = torch.rand(batch_size, 1, 1, device=real_betas.device)
+    alpha_rot = torch.rand(batch_size, 1, 1, device=real_betas.device)
+    interpolated_betas = alpha_betas * real_betas + (1 - alpha_betas) * fake_betas
+    interpolated_rots = alpha_rot * real_rots + (1 - alpha_rot) * fake_rots
+    interpolated_betas.requires_grad_(True)
+    interpolated_rots.requires_grad_(True)
     
-    model = Model(inputs=[betas_input, rot_input],
-                  outputs=[score, features],
-                  name='discriminator')
-    return model
-
-
-# -------------------------
-# TERMINE DI GRADIENT PENALTY
-# -------------------------
-
-def gradient_penalty(discriminator, real, fake):
-    batch_size = tf.shape(real[0])[0]  # usa il batch size dal primo tensore
-    alpha_betas = tf.random.uniform(shape=tf.shape(real[0]), minval=0., maxval=1.)
-    alpha_rot = tf.random.uniform(shape=tf.shape(real[1]), minval=0., maxval=1.)
-    interpolated_betas = alpha_betas * real[0] + (1 - alpha_betas) * fake[0]
-    interpolated_rot = alpha_rot * real[1] + (1 - alpha_rot) * fake[1]
-
-    with tf.GradientTape() as tape:
-        tape.watch([interpolated_betas, interpolated_rot])
-        interp_score, _ = discriminator([interpolated_betas, interpolated_rot], training=True)
-    grads_betas, grads_rot = tape.gradient(interp_score, [interpolated_betas, interpolated_rot])
-    grads = tf.concat([tf.reshape(grads_betas, [batch_size, -1]),
-                       tf.reshape(grads_rot, [batch_size, -1])], axis=1)
-    gp = tf.reduce_mean((tf.norm(grads, axis=1) + 1e-8 - 1.)**2)
+    interpolated_score, _ = discriminator(interpolated_betas, interpolated_rots)
+    grad_outputs = torch.ones_like(interpolated_score, device=real_betas.device)
+    gradients = torch.autograd.grad(
+        outputs=interpolated_score,
+        inputs=[interpolated_betas, interpolated_rots],
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )
+    grad_betas, grad_rots = gradients
+    grad_betas = grad_betas.reshape(batch_size, -1)
+    grad_rots = grad_rots.reshape(batch_size, -1)
+    slopes = torch.sqrt(torch.sum(grad_betas**2, dim=1) + torch.sum(grad_rots**2, dim=1))
+    gp = torch.mean((slopes - 1.0) ** 2)
     return gp
 
 
-def train_gan(generator, discriminator,
-              text_data, audio_data, real_betas, real_rot_mats,
-              epochs=1000, batch_size=128, csv_path='gan_metrics.csv',
-              gen_updates=2):
+class MotionDataset(Dataset):
+    def __init__(self, text_data, audio_data, betas_data, rots_data):
+        self.text_data = text_data
+        self.audio_data = audio_data
+        self.betas_data = betas_data
+        self.rots_data = rots_data
+        
+    def __len__(self):
+        return len(self.audio_data)
+    
+    def __getitem__(self, idx):
+        text = torch.tensor(self.text_data[idx], dtype=torch.float32)
+        audio = torch.tensor(self.audio_data[idx], dtype=torch.float32)
+        betas = torch.tensor(self.betas_data[idx], dtype=torch.float32)
+        rots = torch.tensor(self.rots_data[idx], dtype=torch.float32)
+        return text, audio, betas, rots
 
-    text_data = tf.convert_to_tensor(text_data, dtype=tf.float32)
-    audio_data = tf.convert_to_tensor(audio_data, dtype=tf.float32)
-    real_betas = tf.convert_to_tensor(real_betas, dtype=tf.float32)
-    real_rot_mats = tf.convert_to_tensor(real_rot_mats, dtype=tf.float32)
+def collate_fn(batch):
+    texts, audios, betas, rots = zip(*batch)
     
-    if len(text_data.shape) == 2:
-        text_data = tf.expand_dims(text_data, axis=1)
-    if len(audio_data.shape) == 2:
-        audio_data = tf.expand_dims(audio_data, axis=1)
-    if len(real_betas.shape) == 2:
-        real_betas = tf.expand_dims(real_betas, axis=1)
-    if len(real_rot_mats.shape) == 2:
-        real_rot_mats = tf.expand_dims(real_rot_mats, axis=1)
-    
-    dataset = tf.data.Dataset.from_tensor_slices((text_data, audio_data, real_betas, real_rot_mats))
-    dataset = dataset.shuffle(buffer_size=1024).batch(batch_size)
-    
-    # Imposto learning rate differenti:
-    # Il generatore ha un learning rate più alto
-    gen_optimizer = tf.keras.optimizers.Adam(learning_rate=0.00001, beta_1=0.5, beta_2=0.9)
-    disc_optimizer = tf.keras.optimizers.Adam(learning_rate=6e-6, beta_1=0.5, beta_2=0.9)
+    texts_padded = nn.utils.rnn.pad_sequence(texts, batch_first=True)
+    audios = torch.stack(audios)
+    betas = torch.stack(betas)
+    rots = torch.stack(rots)
+    return texts_padded, audios, betas, rots
 
+
+def train_gan(generator, discriminator, 
+              gt_beta_mapper, gt_rot_mapper,
+              dataloader, epochs=200, gen_updates=2, csv_path='gan_metrics.csv'):
     
-    mse_loss = tf.keras.losses.MeanSquaredError()
+    gen_optimizer = optim.Adam(list(generator.parameters()) +
+                               list(gt_beta_mapper.parameters()) +
+                               list(gt_rot_mapper.parameters()),
+                               lr=2e-4, betas=(0.5, 0.9))
+    disc_optimizer = optim.Adam(discriminator.parameters(), lr=5e-6, betas=(0.5, 0.9))
     
-    # Mapper per i ground truth (rimangono invariati)
-    gt_beta_mapper = layers.Dense(10, activation=None, name='gt_beta_mapper')
-    gt_rot_mapper = layers.Dense(9, activation=None, name='gt_rot_mapper')
-    
+    mse_loss = nn.MSELoss()
     metrics_history = []
-    
-    @tf.function
-    def train_step(text_batch, audio_batch, betas_batch, rot_mats_batch):
-
-        with tf.GradientTape(persistent=True) as tape:
-            mapped_betas = gt_beta_mapper(betas_batch)
-            mapped_rot_mats = gt_rot_mapper(rot_mats_batch)
-            
-            fake_betas, fake_rot_mats = generator([text_batch, audio_batch], training=True)
-            
-            real_score, real_features = discriminator([mapped_betas, mapped_rot_mats], training=True)
-            fake_score, fake_features = discriminator([fake_betas, fake_rot_mats], training=True)
-            
-            # Loss del discriminatore (WGAN)
-            d_loss = tf.reduce_mean(fake_score) - tf.reduce_mean(real_score)
-            # Gradient Penalty per il discriminatore
-            gp = gradient_penalty(discriminator, (mapped_betas, mapped_rot_mats), (fake_betas, fake_rot_mats))
-            lambda_gp = 10.0
-            d_loss += lambda_gp * gp
-            
-            # Loss del generatore: 
-            # - L'obiettivo WGAN
-            g_loss = -tf.reduce_mean(fake_score)
-            # - Output loss: confronto tra output e ground truth mappati
-            output_loss = mse_loss(fake_betas, mapped_betas) + mse_loss(fake_rot_mats, mapped_rot_mats)
-            # - Feature matching loss: cerca di far sì che le feature intermedie siano simili
-            fm_loss = mse_loss(real_features, fake_features)
-            # Aumentiamo il peso del feature matching loss
-            g_loss += 0.1 * output_loss + 0.2 * fm_loss
-        
-        disc_vars = discriminator.trainable_variables
-        gen_vars = generator.trainable_variables + gt_beta_mapper.trainable_variables + gt_rot_mapper.trainable_variables
-        
-        disc_grads = tape.gradient(d_loss, disc_vars)
-        disc_optimizer.apply_gradients(zip(disc_grads, disc_vars))
-        
-        # Aggiornamento multiplo del generatore
-        for _ in range(gen_updates):
-            gen_grads = tape.gradient(g_loss, gen_vars)
-            gen_optimizer.apply_gradients(zip(gen_grads, gen_vars))
-        del tape
-        
-        real_correct = tf.cast(real_score > 0, tf.float32)
-        fake_correct = tf.cast(fake_score < 0, tf.float32)
-        d_acc = (tf.reduce_mean(real_correct) + tf.reduce_mean(fake_correct)) / 2.0
-        g_acc = tf.reduce_mean(tf.cast(fake_score > 0, tf.float32))
-        
-        return d_loss, g_loss, tf.reduce_mean(real_score), tf.reduce_mean(fake_score), d_acc, g_acc
+    best_metric = float('inf')
+    patience = 5
+    patience_counter = 0
     
     for epoch in range(epochs):
+        generator.train()
+        discriminator.train()
         epoch_d_loss = []
         epoch_g_loss = []
-        epoch_d_acc = []
-        epoch_g_acc = []
-        epoch_r_score = []
-        epoch_f_score = []
+        real_betas_epoch = []
+        real_rots_epoch = []
+        fake_betas_epoch = []
+        fake_rots_epoch = []
         
-        for text_batch, audio_batch, betas_batch, rot_mats_batch in dataset:
-            d_loss, g_loss, r_score, f_score, d_acc, g_acc = train_step(text_batch, audio_batch, betas_batch, rot_mats_batch)
-            epoch_d_loss.append(d_loss.numpy())
-            epoch_g_loss.append(g_loss.numpy())
-            epoch_d_acc.append(d_acc.numpy())
-            epoch_g_acc.append(g_acc.numpy())
-            epoch_r_score.append(r_score.numpy())
-            epoch_f_score.append(f_score.numpy())
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("using device ", device)
+
+        for text_batch, audio_batch, betas_batch, rots_batch in dataloader:
+            torch.autograd.set_detect_anomaly(True)
+            mapped_betas = gt_beta_mapper(betas_batch)
+            mapped_rots = gt_rot_mapper(rots_batch)
+
+            fake_betas, fake_rots = generator(text_batch, audio_batch)
+
+            real_score, real_features = discriminator(mapped_betas, mapped_rots)
+            fake_score, fake_features = discriminator(fake_betas, fake_rots)
+            
+            d_loss = fake_score.mean() - real_score.mean()
+            gp = gradient_penalty(discriminator, mapped_betas, mapped_rots, fake_betas, fake_rots)
+            d_loss = d_loss + 8.0 * gp
+            
+            disc_optimizer.zero_grad()
+            d_loss.backward(retain_graph=True)
+            disc_optimizer.step()
+            
+            mapped_betas = mapped_betas.detach()
+            mapped_rots  = mapped_rots.detach()
+            real_features = real_features.detach()
+            signblue_loss_fn = SignBlueLoss()
+
+            for _ in range(gen_updates):
+                # fake_betas, fake_rots = generator(text_batch, audio_batch)
+                # fake_score, fake_features = discriminator(fake_betas, fake_rots)
+                
+                # g_loss = -fake_score.mean()
+                # output_loss = mse_loss(fake_betas, target_betas) + mse_loss(fake_rots, target_rots)
+                # fm_loss = mse_loss(real_features_detached, fake_features)
+                # g_loss = g_loss + output_loss + fm_loss
+                
+                # gen_optimizer.zero_grad()
+                # g_loss.backward()
+                # gen_optimizer.step()
+                fake_betas, fake_rots = generator(text_batch, audio_batch)
+                fake_score, fake_features = discriminator(fake_betas, fake_rots)
+
+                g_loss = -fake_score.mean() * 0.01
+
+                signblue_loss = signblue_loss_fn(mapped_betas, mapped_rots, fake_betas, fake_rots)
+
+                total_g_loss = g_loss + signblue_loss
+                gen_optimizer.zero_grad()
+                total_g_loss.backward()
+                gen_optimizer.step()
+
+            epoch_d_loss.append(d_loss.item())
+            epoch_g_loss.append(total_g_loss.item())
+            real_betas_epoch.append(mapped_betas.detach().cpu().numpy())
+            real_rots_epoch.append(mapped_rots.detach().cpu().numpy())
+            fake_betas_epoch.append(fake_betas.detach().cpu().numpy())
+            fake_rots_epoch.append(fake_rots.detach().cpu().numpy())
         
         avg_d_loss = np.mean(epoch_d_loss)
         avg_g_loss = np.mean(epoch_g_loss)
-        avg_d_acc = np.mean(epoch_d_acc)
-        avg_g_acc = np.mean(epoch_g_acc)
-        avg_r_score = np.mean(epoch_r_score)
-        avg_f_score = np.mean(epoch_f_score)
+        real_betas_epoch = np.concatenate(real_betas_epoch, axis=0)
+        real_rots_epoch = np.concatenate(real_rots_epoch, axis=0)
+        fake_betas_epoch = np.concatenate(fake_betas_epoch, axis=0)
+        fake_rots_epoch = np.concatenate(fake_rots_epoch, axis=0)
         
-        tf.print(f"Epoch {epoch+1}/{epochs} - D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}, "
-                 f"Real_score: {avg_r_score:.4f}, Fake_score: {avg_f_score:.4f}, "
-                 f"D_acc: {avg_d_acc:.4f}, G_acc: {avg_g_acc:.4f}")
+        metrics_eval = evaluate_motion_metrics(real_betas_epoch, real_rots_epoch,
+                                               fake_betas_epoch, fake_rots_epoch)
+        
+        print(f"Epoch {epoch+1} - D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}, "
+              f"DTW_mean: {metrics_eval['DTW_mean']:.4f}, MSE_pose: {metrics_eval['MSE_pose']:.4f}, "
+              f"MSE_vel: {metrics_eval['MSE_vel']:.4f}, MSE_acc: {metrics_eval['MSE_acc']:.4f}, "
+              f"Diversity: {metrics_eval['Diversity']:.4f}\n")
         
         metrics_history.append({
             "epoch": epoch+1,
             "D_loss": avg_d_loss,
             "G_loss": avg_g_loss,
-            "Real_score": avg_r_score,
-            "Fake_score": avg_f_score,
-            "D_acc": avg_d_acc,
-            "G_acc": avg_g_acc
+            "DTW_mean": metrics_eval['DTW_mean'],
+            "MSE_pose": metrics_eval['MSE_pose'],
+            "MSE_vel": metrics_eval['MSE_vel'],
+            "MSE_acc": metrics_eval['MSE_acc'],
+            "Diversity": metrics_eval['Diversity']
         })
+        
+        current_metric = metrics_eval['DTW_mean']
+        if current_metric < best_metric:
+            best_metric = current_metric
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs.")
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}: DTW_mean did not improve for {patience} consecutive epochs.")
+                break
     
     with open(csv_path, mode='w', newline='') as csv_file:
-        fieldnames = ["epoch", "D_loss", "G_loss", "Real_score", "Fake_score", "D_acc", "G_acc"]
+        fieldnames = ["epoch", "D_loss", "G_loss", "DTW_mean", "MSE_pose", "MSE_vel", "MSE_acc", "Diversity"]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         for m in metrics_history:
             writer.writerow(m)
     
-    tf.print("Training terminato e metriche salvate in", csv_path)
+    print("Training finished. Metrics saved in ", csv_path)
 
-# -------------------------
-# MAIN: Caricamento dati e training
-# -------------------------
+current_dir = os.path.dirname(os.path.abspath(__file__))
+generated_file_folder_path = os.path.join(current_dir, "../../generated_file/")
+audio_embedding_path = os.path.join(generated_file_folder_path, "models/audio_embeddings.npy")
+text_embedding_path = os.path.join(generated_file_folder_path, "models/text_embeddings.npy")
+motion_path = os.path.join(generated_file_folder_path, "pkl_precessed.npz")
+metrics_path = os.path.join(generated_file_folder_path, "models/gan_metrics.csv")
 
-print("Loading FastText model...")
+print("Loading FastText embeddings...")
+text_embeddings = np.load(text_embedding_path)
 print(f"text_embeddings shape: {text_embeddings.shape}")
 
 print("Loading audio embeddings...")
+audio_embeddings = np.load(audio_embedding_path)
 print(f"audio_embeddings shape: {audio_embeddings.shape}")
 
 print("Loading motions...")
+motion_data = np.load(motion_path)
+all_rot_mats = np.array(motion_data["all_rot_mats"], copy=True)
+all_betas = np.array(motion_data["all_betas"], copy=True)
 print(f"all_betas shape: {all_betas.shape}")
 print(f"all_rot_mats shape: {all_rot_mats.shape}")
 
-num_samples = 128
-target_length = 128
+num_samples = audio_embeddings.shape[0]
+target_length = audio_embeddings.shape[1]
 
 all_betas_resampled = split_and_resample_motion(all_betas, num_samples, target_length, dim=1)
 all_rot_mats_resampled = split_and_resample_motion(all_rot_mats, num_samples, target_length, dim=1)
 
-print("Resampled all_betas shape:", all_betas_resampled.shape)
-print("Resampled all_rot_mats shape:", all_rot_mats_resampled.shape)
+n_audio = audio_embeddings.shape[0]
+total_text = text_embeddings.shape[0]
+base = total_text // n_audio 
+remainder = total_text % n_audio
+text_counts = [base] * n_audio
+for i in range(remainder):
+    text_counts[i] += 1
 
-text_embedding_dim = text_embeddings.shape[-1]
+grouped_text_data = []
+start = 0
+for count in text_counts:
+    group = text_embeddings[start:start+count]
+    grouped_text_data.append(group)
+    start += count
+
+target_length_text = 16000
+resampled_text_data = []
+for group in grouped_text_data:
+    group_tensor = torch.tensor(group, dtype=torch.float32)
+    concatenated = group_tensor.view(-1, group_tensor.shape[-1])
+
+    resampled = resample_sequence(concatenated.cpu().numpy(), target_length_text)
+    resampled_text_data.append(resampled.cpu().numpy())
+
+final_text_embeddings = np.stack(resampled_text_data, axis=0)
+print(f"final_text_embeddings shape: {final_text_embeddings.shape}")
+
+
+text_embedding_dim = final_text_embeddings.shape[-1]
 audio_embedding_dim = audio_embeddings.shape[-1]
 
-tf.print("Building generator...")
-generator = build_generator(text_embedding_dim, audio_embedding_dim, latent_dim=32)
-generator.summary()
+print("Building generator...")
+generator = Generator(text_embedding_dim, audio_embedding_dim, latent_dim=32)
 
-tf.print("Building discriminator...")
-discriminator = build_discriminator(betas_dim=10, rot_dim=9)
-discriminator.summary()
+print("Building discriminator...")
+discriminator = Discriminator(betas_dim=10, rot_dim=42)
 
-tf.print("Starting training...")
-train_gan(generator, discriminator,text_embeddings, audio_embeddings, all_betas_resampled, all_rot_mats_resampled)
+gt_beta_mapper = GTMapper(in_dim=all_betas_resampled.shape[-1], out_dim=10)
+gt_rot_mapper = GTMapper(in_dim=all_rot_mats_resampled.shape[-1], out_dim=42)
 
-gen_path = os.path.join(generated_file_folder_path, "generator_model.keras")
-disc_path = os.path.join(generated_file_folder_path, "discriminator_model.keras")
+
+dataset = MotionDataset(final_text_embeddings, audio_embeddings, all_betas_resampled, all_rot_mats_resampled)
+dataloader = DataLoader(dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+
+
+print("Starting training...")
+train_gan(generator, discriminator, gt_beta_mapper, gt_rot_mapper, dataloader,
+          epochs=200, gen_updates=2, csv_path=metrics_path)
+
+gen_path = os.path.join(generated_file_folder_path, "models/generator_model.pth")
+disc_path = os.path.join(generated_file_folder_path, "models/discriminator_model.pth")
 os.makedirs(os.path.dirname(gen_path), exist_ok=True)
-generator.export(gen_path)
-discriminator.export(disc_path)
-tf.print("Generator and discriminator saved.")
+torch.save(generator.state_dict(), gen_path)
+torch.save(discriminator.state_dict(), disc_path)
+print("Generator and discriminator saved.")

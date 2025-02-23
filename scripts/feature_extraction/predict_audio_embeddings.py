@@ -21,7 +21,9 @@ def getAudioEmbedding(file_path):
     audio_model_path = os.path.join(FileUtil.MODEL_FOLDER_PATH, "audio_embedding.h5")
     print(f"Loading model from {audio_model_path}")
 
-    audio_model = load_model(audio_model_path)
+    audio_model = load_model(audio_model_path, compile=False)
+
+    audio_tensor = tf.expand_dims(audio_tensor, axis=-1)
 
     audio_embedding = audio_model.predict(audio_tensor)
 
