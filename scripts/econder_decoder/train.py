@@ -9,35 +9,50 @@ import csv
 import random
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
-
-#nohup python -u scripts/feature_extraction/enc_dec.py > out.log 2>&1 &
+from scipy.interpolate import interp1d
 
 
 def resample_sequence(data, target_length):
-    data_tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0).transpose(1, 2)
-    resized = F.interpolate(data_tensor, size=target_length, mode='area')
-    resized = resized.transpose(1, 2).squeeze(0)
-    return resized
+    original_length = data.shape[0]
+
+    if original_length == target_length:
+        return data
+
+    x_original = np.linspace(0, 1, original_length)
+    x_target = np.linspace(0, 1, target_length)
+
+    if data.ndim == 1:
+        return np.interp(x_target, x_original, data)
+
+    resampled = np.array([np.interp(x_target, x_original, data[:, col]) for col in range(data.shape[1])]).T
+    return resampled
 
 def split_and_resample_motion(motion_array, num_samples, target_length, dim):
     total_frames = motion_array.shape[0]
     frames_per_sample = total_frames / num_samples
+
     segments = []
     for i in range(num_samples):
         start = int(i * frames_per_sample)
         end = int((i + 1) * frames_per_sample)
+        
+        if end > total_frames:
+            end = total_frames
+
         segment = motion_array[start:end]
-        if len(segment.shape) == 1:
+
+        if segment.ndim == 1:
             segment = np.expand_dims(segment, axis=-1)
-        if segment.shape[-1] != dim:
-            if segment.shape[-1] < dim:
-                repeat = dim - segment.shape[-1]
-                segment = np.concatenate([segment, np.repeat(segment[:, -1:], repeat, axis=-1)], axis=-1)
-            else:
-                segment = segment[:, :dim]
-        resampled = resample_sequence(segment, target_length).cpu().numpy()
+
+        if segment.shape[-1] < dim:
+            segment = np.pad(segment, ((0, 0), (0, dim - segment.shape[-1])), mode='reflect')
+        elif segment.shape[-1] > dim:
+            segment = segment[:, :dim]
+
+        resampled = resample_sequence(segment, target_length)
         segments.append(resampled)
-    return np.stack(segments)
+
+    return np.array(segments)
 
 
 class RepeatText(nn.Module):
@@ -47,21 +62,25 @@ class RepeatText(nn.Module):
         return text_state_expanded
 
 class Generator(nn.Module):
-    def __init__(self, text_embedding_dim, audio_embedding_dim, latent_dim=16):
+    def __init__(self, text_embedding_dim, audio_embedding_dim, latent_dim=16, noise_dim=8):
         super(Generator, self).__init__()
         self.text_encoder = nn.GRU(input_size=text_embedding_dim, hidden_size=latent_dim, batch_first=True)
         self.audio_encoder = nn.GRU(input_size=audio_embedding_dim, hidden_size=latent_dim, batch_first=True)
-        self.decoder_gru = nn.GRU(input_size=latent_dim*2, hidden_size=latent_dim, batch_first=True)
+        self.decoder_gru = nn.GRU(input_size=(latent_dim * 2) + noise_dim, hidden_size=latent_dim, batch_first=True)
+        #self.decoder_gru = nn.GRU(input_size=(latent_dim * 2), hidden_size=latent_dim, batch_first=True)
         self.fc_betas = nn.Linear(latent_dim, 10)
         self.fc_rot_mats = nn.Linear(latent_dim, 42)
         self.repeat_text = RepeatText()
+        self.noise_dim = noise_dim
         
     def forward(self, text_input, audio_input):
         text_encoded, text_state = self.text_encoder(text_input)  
         text_state = text_state.squeeze(0)
         audio_encoded, _ = self.audio_encoder(audio_input)
         repeated_text = self.repeat_text(text_state, audio_encoded)
-        x = torch.cat([audio_encoded, repeated_text], dim=-1)
+        latent_noise = torch.randn((audio_encoded.shape[0], audio_encoded.shape[1], self.noise_dim), device=text_input.device)
+        x = torch.cat([audio_encoded, repeated_text, latent_noise], dim=-1)
+        #x = torch.cat([audio_encoded, repeated_text], dim=-1)
         x, _ = self.decoder_gru(x)
         betas = self.fc_betas(x)
         rot_mats = self.fc_rot_mats(x)
@@ -73,7 +92,7 @@ class Discriminator(nn.Module):
         self.conv1 = nn.Conv1d(in_channels=betas_dim+rot_dim, out_channels=128, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(128)
         self.leaky_relu = nn.LeakyReLU(0.2)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.1)
         self.fc = nn.Linear(128, 1)
         
     def forward(self, betas, rot_mats):
@@ -146,8 +165,9 @@ class SignBlueLoss(nn.Module):
                 "MSE_vel": 0.2,
                 "MSE_acc": 0.2,
                 "DTW_mean": 0.2,
-                "Diversity": 0.5
+                "Diversity": 0.4
             }
+
         else:
             self.weights = weights
 
@@ -295,8 +315,8 @@ def train_gan(generator, discriminator,
     gen_optimizer = optim.Adam(list(generator.parameters()) +
                                list(gt_beta_mapper.parameters()) +
                                list(gt_rot_mapper.parameters()),
-                               lr=2e-4, betas=(0.5, 0.9))
-    disc_optimizer = optim.Adam(discriminator.parameters(), lr=5e-6, betas=(0.5, 0.9))
+                               lr=0.00015, betas=(0.5, 0.9))
+    disc_optimizer = optim.Adam(discriminator.parameters(), lr=1e-5, betas=(0.5, 0.9))
     
     mse_loss = nn.MSELoss()
     metrics_history = []
@@ -329,7 +349,7 @@ def train_gan(generator, discriminator,
             
             d_loss = fake_score.mean() - real_score.mean()
             gp = gradient_penalty(discriminator, mapped_betas, mapped_rots, fake_betas, fake_rots)
-            d_loss = d_loss + 8.0 * gp
+            d_loss = d_loss + 6.0 * gp
             
             disc_optimizer.zero_grad()
             d_loss.backward(retain_graph=True)
@@ -341,21 +361,11 @@ def train_gan(generator, discriminator,
             signblue_loss_fn = SignBlueLoss()
 
             for _ in range(gen_updates):
-                # fake_betas, fake_rots = generator(text_batch, audio_batch)
-                # fake_score, fake_features = discriminator(fake_betas, fake_rots)
-                
-                # g_loss = -fake_score.mean()
-                # output_loss = mse_loss(fake_betas, target_betas) + mse_loss(fake_rots, target_rots)
-                # fm_loss = mse_loss(real_features_detached, fake_features)
-                # g_loss = g_loss + output_loss + fm_loss
-                
-                # gen_optimizer.zero_grad()
-                # g_loss.backward()
-                # gen_optimizer.step()
+             
                 fake_betas, fake_rots = generator(text_batch, audio_batch)
                 fake_score, fake_features = discriminator(fake_betas, fake_rots)
 
-                g_loss = -fake_score.mean() * 0.01
+                g_loss = -fake_score.mean() * 0.02
 
                 signblue_loss = signblue_loss_fn(mapped_betas, mapped_rots, fake_betas, fake_rots)
 
@@ -433,11 +443,13 @@ audio_embeddings = np.load(audio_embedding_path)
 print(f"audio_embeddings shape: {audio_embeddings.shape}")
 
 print("Loading motions...")
-motion_data = np.load(motion_path)
-all_rot_mats = np.array(motion_data["all_rot_mats"], copy=True)
-all_betas = np.array(motion_data["all_betas"], copy=True)
+motion_data = np.load(motion_path, mmap_mode="r")
+all_rot_mats = np.array(motion_data["all_rot_mats"])
+all_betas = np.array(motion_data["all_betas"])
 print(f"all_betas shape: {all_betas.shape}")
 print(f"all_rot_mats shape: {all_rot_mats.shape}")
+print("all_betas: ", all_betas)
+print("rot mats: ", all_rot_mats)
 
 num_samples = audio_embeddings.shape[0]
 target_length = audio_embeddings.shape[1]
@@ -467,7 +479,7 @@ for group in grouped_text_data:
     concatenated = group_tensor.view(-1, group_tensor.shape[-1])
 
     resampled = resample_sequence(concatenated.cpu().numpy(), target_length_text)
-    resampled_text_data.append(resampled.cpu().numpy())
+    resampled_text_data.append(resampled.cpu().numpy() if isinstance(resampled, torch.Tensor) else resampled)
 
 final_text_embeddings = np.stack(resampled_text_data, axis=0)
 print(f"final_text_embeddings shape: {final_text_embeddings.shape}")

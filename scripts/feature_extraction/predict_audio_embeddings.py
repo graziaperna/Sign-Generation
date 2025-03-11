@@ -3,7 +3,6 @@ import os
 import sys
 import numpy as np
 import tensorflow as tf
-from tensorflow.python.keras.backend import clear_session
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

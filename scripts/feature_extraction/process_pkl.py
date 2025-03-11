@@ -2,17 +2,11 @@ import os
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers
-from gensim.models import FastText
-from tensorflow.keras.optimizers import Adam
-import csv
+import psutil
 import gc
 import torch
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from econder_decoder import const
-import h5py
-from gensim.models import FastText
 from utils.file import FileUtil
 print(tf.__version__)
 
@@ -67,9 +61,6 @@ def get_movement_data(movement_data):
 
 
 def tensor_to_numpy(tensor):
-    '''
-    Converts a tensor to a numpy array.
-    '''
     if isinstance(tensor, torch.Tensor):
         if tensor.is_cuda:
             tensor = tensor.cpu()
@@ -99,7 +90,6 @@ for i, file in enumerate(files):
     print(f"File {file} processed.")
     print(f"Files remaining: {len(files) - (i + 1)}")
 
-import psutil
 print(f"Available memory: {psutil.virtual_memory().available / (1024 ** 3):.2f} GB")
 print("Data concatenation starting...")
 all_rot_mats = np.concatenate(rot_mats_list, axis=0)

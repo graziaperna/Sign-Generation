@@ -17,7 +17,7 @@ generated_file_folder_path = os.path.join(current_dir, "../../generated_file/")
 xlsx_file_folder_path = os.path.join(current_dir, "../../Tg_Noi_Lis_01_06_2022.txt")
 audio_file_folder_path = os.path.join(current_dir, "../../Tg_Noi_Lis_01_06_2022.mp3")
 
-gen_path = os.path.join(generated_file_folder_path, "models/generator_model.pth")
+gen_path = os.path.join(generated_file_folder_path, "models/generator_model_5.pth")
 audio_embedding_path = os.path.join(generated_file_folder_path, "embeddings/audio_sample.mp3")
 
 
@@ -27,21 +27,25 @@ class RepeatText(nn.Module):
         return repeated_text
 
 class Generator(nn.Module):
-    def __init__(self, text_embedding_dim, audio_embedding_dim, latent_dim=16):
+    def __init__(self, text_embedding_dim, audio_embedding_dim, latent_dim=16, noise_dim=8):
         super(Generator, self).__init__()
         self.text_encoder = nn.GRU(input_size=text_embedding_dim, hidden_size=latent_dim, batch_first=True)
         self.audio_encoder = nn.GRU(input_size=audio_embedding_dim, hidden_size=latent_dim, batch_first=True)
-        self.decoder_gru = nn.GRU(input_size=latent_dim*2, hidden_size=latent_dim, batch_first=True)
+        self.decoder_gru = nn.GRU(input_size=(latent_dim * 2) + noise_dim, hidden_size=latent_dim, batch_first=True)
+        #self.decoder_gru = nn.GRU(input_size=(latent_dim * 2), hidden_size=latent_dim, batch_first=True)
         self.fc_betas = nn.Linear(latent_dim, 10)
         self.fc_rot_mats = nn.Linear(latent_dim, 42)
         self.repeat_text = RepeatText()
+        self.noise_dim = noise_dim
         
     def forward(self, text_input, audio_input):
         text_encoded, text_state = self.text_encoder(text_input)  
         text_state = text_state.squeeze(0)
         audio_encoded, _ = self.audio_encoder(audio_input)
         repeated_text = self.repeat_text(text_state, audio_encoded)
-        x = torch.cat([audio_encoded, repeated_text], dim=-1)
+        latent_noise = torch.randn((audio_encoded.shape[0], audio_encoded.shape[1], self.noise_dim), device=text_input.device)
+        x = torch.cat([audio_encoded, repeated_text, latent_noise], dim=-1)
+        #x = torch.cat([audio_encoded, repeated_text], dim=-1)
         x, _ = self.decoder_gru(x)
         betas = self.fc_betas(x)
         rot_mats = self.fc_rot_mats(x)
@@ -96,6 +100,3 @@ with open(txt_path, "w") as f:
     np.savetxt(f, rot_2d, fmt="%.6f", delimiter=" ")
     
 print("File generated:", txt_path)
-
-
-

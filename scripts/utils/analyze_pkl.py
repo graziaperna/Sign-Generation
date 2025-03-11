@@ -5,14 +5,12 @@ import torch
 
 
 def tensor_to_numpy(tensor):
-    """Converte un tensore PyTorch in un array NumPy, spostandolo prima su CPU se necessario."""
     if isinstance(tensor, torch.Tensor):
         return tensor.detach().cpu().numpy()
     return tensor
 
 
 def process_data(data, name=""):
-    """Processa i dati, convertendo tensori in array NumPy e appiattendo il risultato."""
     if data is None or len(data) == 0:
         print(f"Data for {name} is empty or None.")
         return data
@@ -43,7 +41,6 @@ def process_data(data, name=""):
 
 movement_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../datasets/integration/Tg_Noi_Lis_15_04_2022/Tg_Noi_Lis_15_04_2022_0.pkl")
 
-# Carica il file pickle
 with open(movement_model_path, "rb") as f:
     movement_data = pickle.load(f)
 
@@ -52,11 +49,9 @@ print("movement keys:", movement_data.keys())
 processed_data = {}
 for key, value in movement_data.items():
     try:
-        # Processa i dati per ogni chiave
         processed_data[key] = process_data(value, name=key)
         print(f"{key}: {type(processed_data[key])} - Shape: {processed_data[key].shape if isinstance(processed_data[key], np.ndarray) else 'N/A'}")
         
-        # Controlla se 'rot_mats' è presente
         if 'rot_mats' in processed_data:
             print("Found rot_mats:", processed_data['rot_mats'])
         else:

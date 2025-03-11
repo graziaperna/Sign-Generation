@@ -1,8 +1,4 @@
-from io import StringIO
 import sys
-import pandas as pd
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
 from gensim.models import FastText
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import sys
